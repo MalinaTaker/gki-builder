@@ -1,0 +1,153 @@
+name: CI Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch'
+        required: true
+        default: 'android12-5.10-lts'
+      ver:
+        description: 'Localversion'
+        required: true
+        default: '-android12-9'
+      user:
+        description: 'Build User'
+        required: true
+        default: 'builder'
+      host:
+        description: 'Build Host'
+        required: true
+        default: 'localhost'
+      spoof:
+        description: 'Spoof Sublevel'
+        type: boolean
+        required: true
+        default: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Env Setup
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc "/usr/local/share/boost" "$AGENT_TOOLSDIRECTORY"
+          sudo fallocate -l 16G /swapfile_ci
+          sudo chmod 600 /swapfile_ci
+          sudo mkswap /swapfile_ci
+          sudo swapon /swapfile_ci
+
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git curl zip unzip build-essential libssl-dev \
+            bc bison flex libelf-dev python3 pahole cpio \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+
+      - name: Sync
+        run: |
+          mkdir -p ws && cd ws
+          git clone --depth=1 -b ${{ github.event.inputs.branch }} https://android.googlesource.com/kernel/common common
+          mkdir -p clang && cd clang
+          curl -LO https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android12-release/clang-r416183b.tar.gz
+          tar -xzf clang-r416183b.tar.gz
+          rm clang-r416183b.tar.gz
+
+      - name: Patch
+        run: |
+          cd ws/common
+          curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash -
+
+      - name: Configure
+        run: |
+          cd ws/common
+          sed -i 's/echo "+"/# echo "+"/g' scripts/setlocalversion
+          sed -i 's/-dirty//g' scripts/setlocalversion
+          if [ "${{ github.event.inputs.spoof }}" = "true" ]; then
+            sed -i 's/^SUBLEVEL = .*/SUBLEVEL = 226/g' Makefile
+          fi
+          sed -i '/CONFIG_LOCALVERSION/d' arch/arm64/configs/gki_defconfig
+          cat << EOF >> arch/arm64/configs/gki_defconfig
+          CONFIG_LOCALVERSION="${{ github.event.inputs.ver }}"
+          CONFIG_KSU=y
+          CONFIG_KPROBES=y
+          CONFIG_HAVE_KPROBES=y
+          CONFIG_KPROBE_EVENTS=y
+          CONFIG_COMPAT=y
+          CONFIG_LTO_CLANG=y
+          CONFIG_LTO_CLANG_THIN=y
+          EOF
+
+      - name: Compile
+        run: |
+          cd ws/common
+          export PATH="$(realpath ../clang/bin):$PATH"
+          export KBUILD_BUILD_USER="${{ github.event.inputs.user }}"
+          export KBUILD_BUILD_HOST="${{ github.event.inputs.host }}"
+          export KBUILD_BUILD_TIMESTAMP="$(TZ=Asia/Jakarta date '+%a %b %d %H:%M:%S WIB %Y')"
+          
+          make -j$(nproc --all) O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
+            gki_defconfig
+            
+          ./scripts/config --file out/.config \
+            -d LTO_CLANG_FULL \
+            -e LTO_CLANG_THIN \
+            --set-str LOCALVERSION "${{ github.event.inputs.ver }}" \
+            -d LOCALVERSION_AUTO
+            
+          make -j$(nproc --all) O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
+            olddefconfig
+            
+          make -j$(nproc --all) O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
+            Image.gz
+
+      - name: Package
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ak3
+          cp ws/common/out/arch/arm64/boot/Image.gz ak3/
+          cd ak3
+          sed -i 's/do.devicecheck=1/do.devicecheck=0/g' anykernel.sh
+          sed -i 's/block=\/dev\/block\/platform\/omap\/omap_hsmmc.0\/by-name\/boot;/block=auto;/g' anykernel.sh
+          sed -i 's/is_slot_device=0;/is_slot_device=auto;/g' anykernel.sh
+          zip -r9 ../ak3-package.zip * -x .git README.md *placeholder
+          cd ..
+          
+          cat << 'EOF' > service.sh
+          #!/system/bin/sh
+          while [ "$(getprop sys.boot_completed)" != "1" ]; do
+              sleep 2
+          done
+          echo 100 > /proc/sys/vm/swappiness
+          echo 0 > /proc/sys/vm/page-cluster
+          echo 60 > /proc/sys/vm/vfs_cache_pressure
+          echo 15 > /proc/sys/vm/dirty_ratio
+          echo 5 > /proc/sys/vm/dirty_background_ratio
+          echo 3000 > /proc/sys/vm/stat_interval
+          echo 0 > /proc/sys/vm/compaction_proactiveness
+          for queue in /sys/block/*/queue; do
+              echo 0 > "$queue/add_random" 2>/dev/null
+              echo 0 > "$queue/iostats" 2>/dev/null
+              echo 2 > "$queue/rq_affinity" 2>/dev/null
+          done
+          for cpu in /sys/devices/system/cpu/cpufreq/policy*; do
+              echo "schedutil" > "$cpu/scaling_governor" 2>/dev/null
+              echo 0 > "$cpu/schedutil/up_rate_limit_us" 2>/dev/null
+              echo 15000 > "$cpu/schedutil/down_rate_limit_us" 2>/dev/null
+          done
+          EOF
+          chmod +x service.sh
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-output
+          path: |
+            ak3-package.zip
+            ws/common/out/arch/arm64/boot/Image.gz
+            service.sh
